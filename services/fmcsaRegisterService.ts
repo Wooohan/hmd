@@ -12,7 +12,7 @@ export interface FMCSARegisterEntry {
 }
 
 /**
- * Save FMCSA Register entries to Supabase
+ * Save FMCSA Register entries to Supabase.
  */
 export const saveFMCSARegisterEntries = async (
   entries: FMCSARegisterEntry[],
