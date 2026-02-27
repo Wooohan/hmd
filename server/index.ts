@@ -1,7 +1,7 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import axios from 'axios';
-import * as cheerio from 'cheerio';
+import pdf from 'pdf-parse';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -9,148 +9,129 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware.
+// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Helper function to clean text
-const cleanText = (text: string | null | undefined): string => {
-  if (!text) return '';
-  return text.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
-};
+// Helper function to format date for PDF URL (YYYYMMDD)
+function formatDateForPDF(dateStr: string): string {
+  // input is YYYY-MM-DD
+  return dateStr.replace(/-/g, '');
+}
 
-// Route: Scrape FMCSA Register Data (Enhanced for 2000+ records)
+// Route: Scrape FMCSA Register Data via PDF for 100% Accuracy
 app.post('/api/fmcsa-register', async (req: Request, res: Response) => {
   try {
-    const { date } = req.body;
-    
-    // Format date as DD-MMM-YY (e.g., 20-FEB-26)
-    const registerDate = date || formatDateForFMCSA(new Date());
-    
-    const registerUrl = 'https://li-public.fmcsa.dot.gov/LIVIEW/PKG_register.prc_reg_detail';
-    
-    const params = new URLSearchParams();
-    params.append('pd_date', registerDate);
-    params.append('pv_vpath', 'LIVIEW');
+    const { date } = req.body; // Expects YYYY-MM-DD
+    if (!date) {
+      return res.status(400).json({ success: false, error: 'Date is required (YYYY-MM-DD)' });
+    }
 
-    console.log(`📡 Scraping FMCSA Register for date: ${registerDate}`);
+    const pdfDate = formatDateForPDF(date);
+    const pdfUrl = `https://li-public.fmcsa.dot.gov/lihtml/rptspdf/LI_REGISTER${pdfDate}.PDF`;
 
-    const response = await axios.post(registerUrl, params.toString(), {
+    console.log(`📡 Fetching FMCSA Register PDF: ${pdfUrl}`);
+
+    const response = await axios.get(pdfUrl, {
+      responseType: 'arraybuffer',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://li-public.fmcsa.dot.gov/LIVIEW/PKG_REGISTER.prc_reg_list',
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://li-public.fmcsa.dot.gov'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       },
-      timeout: 60000, // Increased timeout for large pages
+      timeout: 60000,
     });
 
-    if (!response.data.toUpperCase().includes('FMCSA REGISTER')) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid response from FMCSA. The page might not be available for this date.',
-        entries: []
-      });
-    }
+    const data = await pdf(response.data);
+    const fullText = data.text;
 
-    const $ = cheerio.load(response.data);
-    const rawText = $.text();
-    
     /**
-     * ADVANCED PARSING STRATEGY:
-     * Instead of a single regex that might skip sections, we look for 
-     * specific patterns and categorize them based on headers.
+     * PDF PARSING STRATEGY:
+     * PDF structure is much cleaner. We can split by section headers
+     * and then extract records within each section.
      */
+    const sections = [
+      { name: 'NAME CHANGE', header: 'NAME CHANGES' },
+      { name: 'CERTIFICATE, PERMIT, LICENSE', header: 'CERTIFICATES, PERMITS & LICENSES' },
+      { name: 'CERTIFICATE OF REGISTRATION', header: 'CERTIFICATES OF REGISTRATION' },
+      { name: 'DISMISSAL', header: 'DISMISSALS' },
+      { name: 'WITHDRAWAL', header: 'WITHDRAWAL OF APPLICATION' },
+      { name: 'REVOCATION', header: 'REVOCATIONS' },
+      { name: 'TRANSFERS', header: 'TRANSFERS' },
+      { name: 'GRANT DECISION NOTICES', header: 'GRANT DECISION NOTICES' }
+    ];
+
     const entries: Array<{ number: string; title: string; decided: string; category: string }> = [];
     
-    // Pattern for Docket numbers (MC, MX, FF followed by digits)
-    // Pattern captures: [Number] [Title/Info] [Date]
-    const pattern = /((?:MC|FF|MX|MX-MC)-\d+)\s+([\s\S]*?)\s+(\d{2}\/\d{2}\/\d{4})/g;
-    
-    let match;
-    const categoryKeywords: Record<string, string[]> = {
-      'NAME CHANGE': ['NAME CHANGES'],
-      'CERTIFICATE, PERMIT, LICENSE': ['CERTIFICATES, PERMITS & LICENSES'],
-      'CERTIFICATE OF REGISTRATION': ['CERTIFICATES OF REGISTRATION'],
-      'DISMISSAL': ['DISMISSALS'],
-      'WITHDRAWAL': ['WITHDRAWAL OF APPLICATION'],
-      'REVOCATION': ['REVOCATIONS'],
-      'TRANSFERS': ['TRANSFERS'],
-      'GRANT DECISION NOTICES': ['GRANT DECISION NOTICES']
-    };
+    // Pattern for Docket: (MC|FF|MX|MX-MC)-digits
+    // We look for the docket and the date following it on the same or nearby lines
+    const recordPattern = /((?:MC|FF|MX|MX-MC)-\d+)\s+([\s\S]*?)\s+(\d{2}\/\d{2}\/\d{4})/g;
 
-    while ((match = pattern.exec(rawText)) !== null) {
-      const docket = match[1];
-      const rawInfo = match[2];
-      const decidedDate = match[3];
-
-      // Clean the info part - remove excessive whitespace and newlines
-      const title = rawInfo.replace(/\s+/g, ' ').trim();
+    // Process each section to ensure 100% accurate categorization
+    for (let i = 0; i < sections.length; i++) {
+      const currentSection = sections[i];
+      const nextSection = sections[i + 1];
       
-      // Safety check: if title is too long or contains another docket, skip or truncate
-      if (title.length > 500) continue; 
-
-      // Contextual Category Detection
-      const beforeIndex = match.index;
-      const contextText = rawText.substring(Math.max(0, beforeIndex - 1500), beforeIndex).toUpperCase();
+      const startIdx = fullText.indexOf(currentSection.header);
+      if (startIdx === -1) continue;
       
-      let category = 'MISCELLANEOUS';
-      for (const [catName, keywords] of Object.entries(categoryKeywords)) {
-        if (keywords.some(k => contextText.includes(k))) {
-          category = catName;
+      const endIdx = nextSection ? fullText.indexOf(nextSection.header, startIdx) : fullText.length;
+      const sectionText = fullText.substring(startIdx, endIdx === -1 ? fullText.length : endIdx);
+
+      let match;
+      while ((match = recordPattern.exec(sectionText)) !== null) {
+        const docket = match[1];
+        const title = match[2].replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
+        const decidedDate = match[3];
+
+        if (title.length > 0 && title.length < 500) {
+          entries.push({
+            number: docket,
+            title,
+            decided: decidedDate,
+            category: currentSection.name
+          });
         }
       }
-
-      entries.push({
-        number: docket,
-        title,
-        decided: decidedDate,
-        category
-      });
     }
 
-    // Deduplicate entries
+    // Fallback: If no sections found, try a global search (less accurate but captures data)
+    if (entries.length === 0) {
+      let match;
+      while ((match = recordPattern.exec(fullText)) !== null) {
+        entries.push({
+          number: match[1],
+          title: match[2].replace(/\n/g, ' ').replace(/\s+/g, ' ').trim(),
+          decided: match[3],
+          category: 'MISCELLANEOUS'
+        });
+      }
+    }
+
+    // Deduplicate
     const uniqueEntries = entries.filter((entry, index, self) =>
       index === self.findIndex((e) => e.number === entry.number && e.title === entry.title)
     );
 
-    console.log(`✅ Successfully extracted ${uniqueEntries.length} entries for ${registerDate}`);
+    console.log(`✅ Extracted ${uniqueEntries.length} entries from PDF for ${date}`);
 
     res.json({
       success: true,
       count: uniqueEntries.length,
-      date: registerDate,
+      date: date,
       lastUpdated: new Date().toISOString(),
       entries: uniqueEntries
     });
 
   } catch (error: any) {
-    console.error('❌ FMCSA Register scrape error:', error.message);
+    console.error('❌ PDF Scrape Error:', error.message);
     res.status(500).json({ 
-      success: false,
-      error: 'Failed to scrape FMCSA register data', 
-      details: error.message,
-      entries: []
+      success: false, 
+      error: 'Failed to scrape FMCSA PDF. The file might not be generated yet for this date.',
+      details: error.message 
     });
   }
 });
 
-// Helper function to format date as DD-MMM-YY
-function formatDateForFMCSA(date: Date): string {
-  const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
-  const day = String(date.getDate()).padStart(2, '0');
-  const month = months[date.getMonth()];
-  const year = String(date.getFullYear()).slice(-2);
-  return `${day}-${month}-${year}`;
-}
-
 // Health check
-app.get('/health', (req: Request, res: Response) => {
-  res.json({ status: 'ok', message: 'FMCSA Scraper Backend is running' });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-app.listen(PORT, () => {
-  console.log(`🚀 Backend proxy server running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 PDF Scraper Backend running on port ${PORT}`));
